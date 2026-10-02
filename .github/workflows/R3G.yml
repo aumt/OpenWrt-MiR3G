@@ -26,7 +26,12 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    # ubuntu-20.04 已被 GitHub 彻底下架（actions/runner-images 里 Ubuntu2004-Readme.md
+    # 已删除，可用标签只剩 ubuntu-22.04 / 24.04(=latest) / 26.04 / ubuntu-slim）。
+    # 标签匹配不到 runner 时的症状很有迷惑性：run 永远停在 queued，不报错也不失败。
+    # 用 22.04 是因为 lede 官方 README 明确写「推荐 Debian 或 Ubuntu LTS 22/24」，
+    # 下面的依赖清单也取自该 README，两者配套。
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout
@@ -38,7 +43,20 @@ jobs:
       run: |
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        # 原来这里是 $(curl -fsSL git.io/depends-ubuntu-2004)。git.io 是 GitHub 在 2022 年
+        # 停掉的短链服务，现在返回 404 —— 而命令替换失败不会让整条命令失败，
+        # `apt-get install` 收到空参数只会「成功地装了 0 个包」，于是编译依赖全缺，
+        # 一直拖到 make 阶段才炸，日志上完全看不出是这里的问题。
+        # 改成把清单内联进来，内容取自 coolsnowwolf/lede 仓库 README「安装编译依赖」一节
+        # （与所编源码同源，且该节明确推荐 Ubuntu LTS 22/24，与上面的 runs-on 配套）。
+        sudo -E apt-get -qq install -y \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+          genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
+          libreadline-dev libssl-dev libtool llvm lrzsz libnsl-dev ninja-build p7zip p7zip-full patch pkgconf \
+          python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion \
+          swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd xz-utils zlib1g-dev
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
