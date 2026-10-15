@@ -1,0 +1,183 @@
+name: R3G-Immortal
+
+# ImmortalWrt 25.12.2 云编译 —— 小米路由器 3G (ramips/mt7621)
+# 与同仓库的 R3G.yml（Lean LEDE 线）是两条独立的构建体系，互不影响。
+# 产物定位：mesh 子设备固件（802.11s + batman-adv），apk 包管理。
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  OPNAME: 'R3G-Immortal'
+  # 与本地 WSL 编译（scripts/build-r3g.sh）严格对齐：同一个 upstream、同一个 tag。
+  # 不跟 master —— 种子配置靠 make defconfig 补默认值，上游默认值一漂移，
+  # 编出来的就不是同一个固件了。改 tag 时两边一起改。
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: v25.12.2
+  CONFIG_FILE: configs/R3G-Immortal.config
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    # ImmortalWrt README 的 Requirements 一节写「Debian 11 is preferred」，
+    # Ubuntu 22.04 与 Debian 11 同期；而 ubuntu-20.04 已被 actions/runner-images
+    # 彻底下架。标签匹配不到 runner 时 run 会永远停在 queued，不报错也不失败，很难查。
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        # 依赖清单 = ImmortalWrt README「Setup dependencies via APT」一节，
+        # 按 ubuntu-22.04 的包名做过归一：
+        #   libncurses-dev  -> libncurses5-dev libncursesw5-dev
+        #   libz-dev        -> zlib1g-dev
+        #   gnutls-dev      -> libgnutls28-dev
+        #   mkisofs         -> genisoimage
+        #   lib32gcc-s1 去掉（x86 才要，ramips 用不上，少一个包名踩空的点）
+        # 并沿用同仓库 R3G.yml 里已在 ubuntu-22.04 上跑通过的写法。
+        # 故意不写成 $(curl ...)：命令替换失败不会让整条命令失败，
+        # apt 收到空参数会「成功地装了 0 个包」，然后一直拖到 make 阶段才炸，
+        # 日志上完全看不出是这里的问题。
+        sudo -E apt-get -qq install -y \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+          bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext \
+          genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+          libgmp3-dev libgnutls28-dev libltdl-dev liblzma-dev libmpc-dev libmpfr-dev libncurses5-dev \
+          libncursesw5-dev libnsl-dev libpython3-dev libreadline-dev libssl-dev libtool libtool-bin libyaml-dev \
+          lld llvm lrzsz msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-docutils \
+          python3-pip python3-ply python3-pyelftools python3-setuptools qemu-utils re2c rsync scons \
+          squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd xz-utils \
+          zlib1g-dev zstd
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+
+    - name: Clone source code
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
+
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
+      run: |
+        [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
+        cd openwrt
+        make defconfig
+
+    - name: 编译前断言（802.11s + batman-adv）
+      run: |
+        cd openwrt
+        FAIL=0
+        for s in \
+          CONFIG_PACKAGE_MAC80211_MESH=y \
+          CONFIG_PACKAGE_wpad-openssl=y \
+          CONFIG_PACKAGE_kmod-batman-adv=y \
+          CONFIG_PACKAGE_batctl-default=y \
+          CONFIG_BATMAN_ADV_BATMAN_V=y \
+          CONFIG_BATMAN_ADV_BLA=y \
+          CONFIG_BATMAN_ADV_DAT=y \
+          CONFIG_BATMAN_ADV_MCAST=y \
+          CONFIG_TARGET_ramips_mt7621_DEVICE_xiaomi_mi-router-3g=y ; do
+          if grep -qx "$s" .config ; then echo "  ✓ $s" ; else echo "  ✗ 缺失 $s" ; FAIL=1 ; fi
+        done
+        [ "$FAIL" -eq 0 ] || { echo "::error::断言失败：802.11s / batman-adv 不齐，编出来也是废固件，不编"; exit 1 ; }
+        echo "包总数 PACKAGE=y: $(grep -cE '^CONFIG_PACKAGE_[A-Za-z0-9_.+-]+=y' .config)"
+        echo "LuCI 应用: $(grep -oE '^CONFIG_PACKAGE_luci-app-[A-Za-z0-9_.+-]+=y' .config | wc -l) 个"
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: Compile the firmware
+      id: compile
+      run: |
+        cd openwrt
+        echo -e "$(nproc) thread compile"
+        # OpenWrt 的 -j 模式不把子 make 的输出写进日志，失败常是一具沉默的尸体，
+        # 所以逐级降并行度重试，最后 -j1 V=s 拿到能看的输出。
+        make -j$(nproc) || make -j2 || make -j1 V=s
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: ImmortalWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        {
+          echo "ImmortalWrt v25.12.2 — ramips/mt7621 — Xiaomi Mi Router 3G"
+          echo ""
+          echo "配置: $CONFIG_FILE (种子配置 + make defconfig)"
+          echo "包管理: apk (.apk)，与 Lean LEDE 线的 ipk 不通用"
+          echo "定位: mesh 子设备 (802.11s + batman-adv)"
+        } > release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@v2
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        name: ${{ env.OPNAME }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: GitRML/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
